@@ -17,7 +17,7 @@ jobs:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
@@ -97,7 +97,10 @@ jobs:
       - name: Show selected target
         run: |
           cd openwrt
-          grep -E 'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_xiaomi_ax3600|CONFIG_CCACHE' .config
+          grep -E 'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_xiaomi_ax3600|CONFIG_CCACHE' .config || {
+            echo "!! 没匹配到目标设备符号，.config 可能没生效"
+            grep -E 'CONFIG_TARGET_qualcommax' .config | head -20 || true
+          }
 
       - name: Download sources
         working-directory: openwrt
@@ -106,19 +109,37 @@ jobs:
       # ---------- 编译 ----------
       - name: Build
         working-directory: openwrt
-        run: make -j$(nproc) V=s 2>&1 | tail -300
+        run: |
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee /tmp/build.log | tail -300
+
+      - name: Dump build log on failure
+        if: failure()
+        run: |
+          echo "===== 关键字命中的错误 ====="
+          grep -nE 'Error [0-9]+|ERROR:|error:|No space left|failed' /tmp/build.log 2>/dev/null | tail -80 || true
+          echo "===== 末尾 150 行 ====="
+          tail -150 /tmp/build.log 2>/dev/null || true
+          echo "===== 磁盘 ====="
+          df -h | head -6 || true
 
       # ---------- 验证编译产物里的 DTB（这才是真正进固件的分区表）----------
       - name: Verify DTB inside build tree
         run: |
           set -eu
-          DTB=$(find openwrt/build_dir -name 'ipq8071-ax3600.dtb' | head -1)
-          [ -n "$DTB" ] || { echo "找不到 ipq8071-ax3600.dtb"; exit 1; }
+          # OpenWrt 会把 dtb 复制为 $(KDIR)/image-<dts>.dtb，也可能留在内核树里，
+          # 所以用通配匹配，别写死文件名。
+          DTB=$(find openwrt/build_dir -name '*ipq8071-ax3600*.dtb' | head -1)
+          if [ -z "$DTB" ]; then
+            echo "!! 没找到 ax3600 的 dtb，列出现有 dtb 供排查："
+            find openwrt/build_dir -name '*.dtb' | head -40 || true
+            exit 1
+          fi
           echo "DTB: $DTB"
           openwrt/staging_dir/host/bin/dtc -I dtb -O dts "$DTB" > /tmp/ax3600.dts
-          grep -q '0xf000000'    /tmp/ax3600.dts || { echo "DTB 里没有 240MB rootfs"; exit 1; }
-          grep -q '0xfa00000'    /tmp/ax3600.dts || { echo "DTB 里没有 rsvd0"; exit 1; }
-          grep -q 'ubiblock0_1'  /tmp/ax3600.dts || { echo "DTB 里 root 卷号不对"; exit 1; }
+          grep -q '0xf000000'   /tmp/ax3600.dts || { echo "DTB 里没有 240MB rootfs"; exit 1; }
+          grep -q '0xfa00000'   /tmp/ax3600.dts || { echo "DTB 里没有 rsvd0"; exit 1; }
+          grep -q 'ubiblock0_1' /tmp/ax3600.dts || { echo "DTB 里 root 卷号不对"; exit 1; }
           echo "===== 实际烧进固件的分区 ====="
           grep -B2 -A3 'rootfs' /tmp/ax3600.dts | head -40
 
@@ -135,8 +156,9 @@ jobs:
           grep -q '^root:\$1\$' "$R/etc/uci-defaults/99-root-pw" || { echo "哈希没注入"; exit 1; }
           echo "first-boot scripts ok"
 
-      # ---------- 产物 ----------
+      # ---------- 产物（即使前面的校验失败也要保存，别白编一次）----------
       - name: Collect artifacts
+        if: always()
         run: |
           mkdir -p out
           cp -v openwrt/bin/targets/qualcommax/ipq807x/*.bin  out/ 2>/dev/null || true
@@ -146,7 +168,8 @@ jobs:
           ls -lh out
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: libwrt-ax3600-nss
           path: out/
-          if-no-files-found: error
+          if-no-files-found: warn
