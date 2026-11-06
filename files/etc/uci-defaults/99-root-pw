@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# 首次启动设置 root 密码。
+# HASH 由 CI 在构建时注入（来自 GitHub Secret ROOT_PW_HASH，
+# 未设置时回退到仓库内的 assets/root-pw-hash）。
+# 明文密码不进入镜像，只存 crypt 哈希。
+
+HASH='__ROOT_PW_HASH__'
+
+[ -f /etc/shadow ] || exit 0
+
+if grep -q '^root:' /etc/shadow; then
+	sed -i "s|^root:[^:]*:|root:${HASH}:|" /etc/shadow
+else
+	echo "root:${HASH}:0:0:99999:7:::" >> /etc/shadow
+fi
+
+# 确保 dropbear 允许密码登录（默认已允许，这里只做兜底）
+uci -q set dropbear.@dropbear[0].PasswordAuth='on' && uci -q commit dropbear
+
+exit 0

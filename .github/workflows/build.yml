@@ -1,0 +1,152 @@
+name: build-ax3600-nss
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 20 * * 5'   # 每周六 04:00 (UTC+8)
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      # GitHub 免费 runner 默认只剩 ~14GB，OpenWrt 全量编译要 25GB+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Clone LibWrt 25.12-nss
+        run: |
+          git clone -b 25.12-nss --depth 1 https://github.com/LiBwrt/LibWrt.git openwrt
+
+      # ---------- 缓存 ----------
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref_name }}-${{ hashFiles('configs/**') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.ref_name }}-${{ hashFiles('configs/**') }}-
+            ccache-${{ github.ref_name }}-
+
+      - name: Cache downloaded sources
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ github.ref_name }}-
+
+      # ---------- 预置 root 密码 / 首次开机设置 ----------
+      - name: Bake root password and first-boot defaults
+        env:
+          ROOT_PW_HASH: ${{ secrets.ROOT_PW_HASH }}
+        run: |
+          set -eu
+          HASH="${ROOT_PW_HASH:-$(cat assets/root-pw-hash)}"
+          case "$HASH" in
+            '$1$'*|'$6$'*) ;;
+            *) echo "密码哈希格式不对: $HASH"; exit 1 ;;
+          esac
+          mkdir -p openwrt/files/etc/uci-defaults
+          cp files/etc/uci-defaults/* openwrt/files/etc/uci-defaults/
+          sed -i "s|__ROOT_PW_HASH__|${HASH}|" openwrt/files/etc/uci-defaults/99-root-pw
+          chmod 755 openwrt/files/etc/uci-defaults/*
+          grep -q -- "$HASH" openwrt/files/etc/uci-defaults/99-root-pw
+          echo "root 密码哈希已注入（前 8 位: ${HASH:0:8}）"
+
+      # ---------- 打补丁 ----------
+      - name: Patch AX3600 to large-partition layout
+        run: |
+          python3 patches/ax3600-bigpart.py openwrt
+          echo "===== DTS diff ====="
+          git -C openwrt --no-pager diff -- target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8071-ax3600.dtsi
+          echo "===== platform.sh diff ====="
+          git -C openwrt --no-pager diff -- target/linux/qualcommax/ipq807x/base-files/lib/upgrade/platform.sh
+
+      - name: Verify patched DTS source
+        run: |
+          D=openwrt/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8071-ax3600.dtsi
+          grep -q 'reg = <0xa00000 0xf000000>' "$D" || { echo "rootfs 分区不对"; exit 1; }
+          grep -q 'reg = <0xfa00000 0x80000>'  "$D" || { echo "rsvd0 分区不对"; exit 1; }
+          grep -q 'root=/dev/ubiblock0_1'      "$D" || { echo "bootargs-append 不对"; exit 1; }
+          ! grep -q 'ubi_kernel'               "$D" || { echo "ubi_kernel 仍存在"; exit 1; }
+          echo "DTS source check ok"
+
+      # ---------- 配置 ----------
+      - name: Update feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply defconfig
+        run: |
+          cp configs/ax3600_nss_defconfig openwrt/.config
+          cd openwrt && make defconfig
+
+      - name: Show selected target
+        run: |
+          cd openwrt
+          grep -E 'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_xiaomi_ax3600|CONFIG_CCACHE' .config
+
+      - name: Download sources
+        working-directory: openwrt
+        run: make -j$(nproc) download
+
+      # ---------- 编译 ----------
+      - name: Build
+        working-directory: openwrt
+        run: make -j$(nproc) V=s 2>&1 | tail -300
+
+      # ---------- 验证编译产物里的 DTB（这才是真正进固件的分区表）----------
+      - name: Verify DTB inside build tree
+        run: |
+          set -eu
+          DTB=$(find openwrt/build_dir -name 'ipq8071-ax3600.dtb' | head -1)
+          [ -n "$DTB" ] || { echo "找不到 ipq8071-ax3600.dtb"; exit 1; }
+          echo "DTB: $DTB"
+          openwrt/staging_dir/host/bin/dtc -I dtb -O dts "$DTB" > /tmp/ax3600.dts
+          grep -q '0xf000000'    /tmp/ax3600.dts || { echo "DTB 里没有 240MB rootfs"; exit 1; }
+          grep -q '0xfa00000'    /tmp/ax3600.dts || { echo "DTB 里没有 rsvd0"; exit 1; }
+          grep -q 'ubiblock0_1'  /tmp/ax3600.dts || { echo "DTB 里 root 卷号不对"; exit 1; }
+          echo "===== 实际烧进固件的分区 ====="
+          grep -B2 -A3 'rootfs' /tmp/ax3600.dts | head -40
+
+      # ---------- 验证首次开机脚本确实进了 rootfs ----------
+      - name: Verify first-boot scripts in rootfs
+        run: |
+          set -eu
+          R=$(ls -d openwrt/build_dir/target-*/root-* | head -1)
+          [ -n "$R" ] || { echo "找不到 rootfs staging 目录"; exit 1; }
+          for f in 98-basic-setup 99-root-pw; do
+            test -f "$R/etc/uci-defaults/$f" || { echo "缺少 $f"; exit 1; }
+            test -x "$R/etc/uci-defaults/$f" || { echo "$f 没有执行权限"; exit 1; }
+          done
+          grep -q '^root:\$1\$' "$R/etc/uci-defaults/99-root-pw" || { echo "哈希没注入"; exit 1; }
+          echo "first-boot scripts ok"
+
+      # ---------- 产物 ----------
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp -v openwrt/bin/targets/qualcommax/ipq807x/*.bin  out/ 2>/dev/null || true
+          cp -v openwrt/bin/targets/qualcommax/ipq807x/*.ubi  out/ 2>/dev/null || true
+          cp -v openwrt/bin/targets/qualcommax/ipq807x/*.itb  out/ 2>/dev/null || true
+          cp -v openwrt/bin/targets/qualcommax/ipq807x/sha256sums out/ 2>/dev/null || true
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libwrt-ax3600-nss
+          path: out/
+          if-no-files-found: error

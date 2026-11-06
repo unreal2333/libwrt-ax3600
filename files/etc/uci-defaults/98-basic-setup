@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# 首次启动的基础设置：主机名 / 时区 / LuCI 语言 / zram
+
+uci set system.@system[0].hostname='ax3600'
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci -q set luci.main.lang='zh_cn'
+uci commit system
+uci -q commit luci
+
+# 内存只有 413MB，zram 必开
+if [ -x /etc/init.d/zram ]; then
+	/etc/init.d/zram enable
+else
+	logger -t uci-defaults "zram-swap 未安装，跳过"
+fi
+
+# 关闭无用的非内核热插拔服务，省内存
+for s in usbmode usbmuxd; do
+	[ -x "/etc/init.d/$s" ] && /etc/init.d/$s disable
+done
+
+exit 0
